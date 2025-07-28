@@ -1,0 +1,1401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Daily DC Burned (USD) by OUI Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-2.20.0.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .chart-label { font-size: 18px; font-weight: bold; margin: 30px 0 10px 0; color: #2c3e50;}
+        .input-group { margin: 0.75em 0 0.5em 0; }
+        .validation-info { background: #f8f9fa; padding: 10px; margin: 10px 0; border-radius: 5px; font-size: 12px; }
+        #chart, #projchart, #combochart { width: 1600px; height: 600px; margin-bottom: 30px; }
+    </style>
+</head>
+<body>
+    <h2>Daily DC Burned (USD) by OUI (aggregated from hourly)</h2>
+    <div class="input-group">
+        <label>Show last <input id="hist-days" type="number" min="1" style="width:4em;"> days of historical data</label>
+    </div>
+    <div id="chart"></div>
+    <div class="validation-info" id="validation-info"></div>
+    <div class="chart-label">Projection: Daily DC Burned (USD) by OUI</div>
+    <div class="input-group">
+        <label>Project for <input id="proj-days" type="number" min="1" style="width:4em;"> days into the future</label>
+    </div>
+    <div id="projchart"></div>
+    <div class="chart-label">History + Projection: Combined View (dashed = forecast start)</div>
+    <div class="input-group">
+        <label>Show <input id="combo-hist-days" type="number" min="1" style="width:4em;"> days of historical data, and project <input id="combo-proj-days" type="number" min="1" style="width:4em;"> days ahead</label>
+    </div>
+    <div id="combochart"></div>
+    <script>
+        /**
+         * SEEDED RANDOM NUMBER GENERATOR CLASS
+         * Purpose: Provides reproducible random numbers for consistent forecasting results
+         * Uses Linear Congruential Generator algorithm for deterministic randomness
+         */
+        class SeededRandom {
+            /**
+             * Initialize with a seed value for reproducible random sequences
+             * @param {number} seed - Integer seed value for random number generation
+             */
+            constructor(seed) { 
+                // Ensure seed is within valid range for LCG algorithm
+                this.seed = seed % 2147483647; 
+                if (this.seed <= 0) this.seed += 2147483646; 
+            }
+            
+            /**
+             * Generate next random number in sequence (0 to 1)
+             * Uses Park-Miller LCG: multiplier=16807, modulus=2^31-1
+             * @returns {number} Random float between 0 and 1
+             */
+            next() { 
+                this.seed = this.seed * 16807 % 2147483647; 
+                return (this.seed - 1) / 2147483646; 
+            }
+            
+            /**
+             * Generate random integer within specified range
+             * @param {number} min - Minimum value (inclusive)
+             * @param {number} max - Maximum value (inclusive)
+             * @returns {number} Random integer in [min, max]
+             */
+            randInt(min, max) { 
+                return Math.floor(this.next() * (max - min + 1)) + min; 
+            }
+        }
+
+        /**
+         * OUTLIER DETECTION CLASS
+         * Purpose: Identifies and handles anomalous data points that could skew forecasts
+         * Implements multiple statistical methods for robust outlier detection
+         */
+        class OutlierDetector {
+            /**
+             * IQR (Interquartile Range) Method for Outlier Detection
+             * Identifies values beyond Q1 - 1.5*IQR or Q3 + 1.5*IQR
+             * @param {number[]} data - Array of numeric values
+             * @param {number} multiplier - IQR multiplier (default 1.5)
+             * @returns {Object} Outlier indices, cleaned data, and bounds
+             */
+            static detectIQROutliers(data, multiplier = 1.5) {
+                // Need minimum 4 points for meaningful quartile calculation
+                if (data.length < 4) return { outliers: new Set(), cleaned: [...data] };
+                
+                // Sort data to find quartiles
+                const sorted = [...data].sort((a, b) => a - b);
+                const q1 = this.percentile(sorted, 25), q3 = this.percentile(sorted, 75);
+                const iqr = q3 - q1;
+                
+                // Calculate outlier bounds using IQR method
+                const lowerBound = q1 - multiplier * iqr;
+                const upperBound = q3 + multiplier * iqr;
+                
+                // Identify outlier indices
+                const outliers = new Set();
+                data.forEach((val, i) => { 
+                    if (val < lowerBound || val > upperBound) outliers.add(i); 
+                });
+                
+                return { 
+                    outliers, 
+                    cleaned: data.filter((_, i) => !outliers.has(i)), 
+                    bounds: { lower: lowerBound, upper: upperBound } 
+                };
+            }
+            
+            /**
+             * Modified Z-Score Method for Outlier Detection
+             * More robust than standard Z-score, uses median instead of mean
+             * @param {number[]} data - Array of numeric values
+             * @param {number} threshold - Z-score threshold (default 3.5)
+             * @returns {Object} Outlier indices and cleaned data
+             */
+            static detectModifiedZScore(data, threshold = 3.5) {
+                if (data.length < 3) return { outliers: new Set(), cleaned: [...data] };
+                
+                // Calculate median and median absolute deviation (MAD)
+                const median = this.percentile([...data].sort((a, b) => a - b), 50);
+                const mad = this.percentile(data.map(x => Math.abs(x - median)).sort((a, b) => a - b), 50);
+                
+                const outliers = new Set();
+                if (mad > 0) {
+                    data.forEach((val, i) => {
+                        // Modified Z-score formula: 0.6745 * (x - median) / MAD
+                        const modifiedZ = 0.6745 * (val - median) / mad;
+                        if (Math.abs(modifiedZ) > threshold) outliers.add(i);
+                    });
+                }
+                
+                return { outliers, cleaned: data.filter((_, i) => !outliers.has(i)) };
+            }
+            
+            /**
+             * Seasonal Outlier Detection
+             * Detects outliers within seasonal patterns (day of week, month)
+             * @param {number[]} data - Array of numeric values
+             * @param {string[]} dates - Corresponding date strings
+             * @param {number} threshold - Standard deviation threshold
+             * @returns {Object} Outlier indices and cleaned data
+             */
+            static detectSeasonalOutliers(data, dates, threshold = 2.5) {
+                if (data.length < 14) return { outliers: new Set(), cleaned: [...data] };
+                
+                const outliers = new Set();
+                // Group data by day of week and month for seasonal analysis
+                const seasonalGroups = { 
+                    dow: Array(7).fill().map(() => []), // Day of week groups
+                    monthly: Array(12).fill().map(() => []) // Monthly groups
+                };
+                
+                // Categorize each data point by its seasonal context
+                data.forEach((val, i) => {
+                    const d = new Date(dates[i]);
+                    seasonalGroups.dow[d.getDay()].push({ val, idx: i });
+                    seasonalGroups.monthly[d.getMonth()].push({ val, idx: i });
+                });
+                
+                // Check for outliers within each seasonal group
+                Object.values(seasonalGroups).forEach(groups => {
+                    groups.forEach(group => {
+                        if (group.length > 3) {
+                            const vals = group.map(g => g.val);
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            const std = Math.sqrt(vals.reduce((sum, val) => sum + (val - mean) ** 2, 0) / vals.length);
+                            
+                            if (std > 0) {
+                                group.forEach(({ val, idx }) => {
+                                    // Flag points beyond threshold standard deviations from group mean
+                                    if (Math.abs((val - mean) / std) > threshold) outliers.add(idx);
+                                });
+                            }
+                        }
+                    });
+                });
+                
+                return { outliers, cleaned: data.filter((_, i) => !outliers.has(i)) };
+            }
+            
+            /**
+             * Calculate percentile of sorted data array
+             * @param {number[]} sortedData - Pre-sorted array of numbers
+             * @param {number} p - Percentile (0-100)
+             * @returns {number} Percentile value
+             */
+            static percentile(sortedData, p) {
+                const idx = (p / 100) * (sortedData.length - 1);
+                const lower = Math.floor(idx), upper = Math.ceil(idx);
+                // Linear interpolation between adjacent values
+                return lower === upper ? sortedData[lower] : 
+                    sortedData[lower] * (upper - idx) + sortedData[upper] * (idx - lower);
+            }
+            
+            /**
+             * Winsorization: Replace extreme values with percentile bounds
+             * Caps outliers at specified percentiles rather than removing them
+             * @param {number[]} data - Array of numeric values
+             * @param {number} lowerPerc - Lower percentile bound (default 5%)
+             * @param {number} upperPerc - Upper percentile bound (default 95%)
+             * @returns {number[]} Winsorized data array
+             */
+            static winsorize(data, lowerPerc = 5, upperPerc = 95) {
+                if (data.length < 10) return [...data];
+                
+                const sorted = [...data].sort((a, b) => a - b);
+                const lowerBound = this.percentile(sorted, lowerPerc);
+                const upperBound = this.percentile(sorted, upperPerc);
+                
+                // Cap values at bounds instead of removing outliers
+                return data.map(val => Math.max(lowerBound, Math.min(upperBound, val)));
+            }
+            
+            /**
+             * Combined Outlier Detection Method
+             * Combines multiple detection methods for comprehensive outlier identification
+             * @param {number[]} data - Array of numeric values
+             * @param {string[]} dates - Corresponding date strings
+             * @returns {Object} Combined outlier analysis results
+             */
+            static detectCombined(data, dates) {
+                // Run all three detection methods
+                const iqrResult = this.detectIQROutliers(data);
+                const zResult = this.detectModifiedZScore(data);
+                const seasonalResult = this.detectSeasonalOutliers(data, dates);
+                
+                // Union of all detected outliers for comprehensive coverage
+                const combinedOutliers = new Set([...iqrResult.outliers, ...zResult.outliers, ...seasonalResult.outliers]);
+                const cleaned = data.filter((_, i) => !combinedOutliers.has(i));
+                const winsorized = this.winsorize(data);
+                
+                return {
+                    outliers: combinedOutliers,
+                    cleaned,
+                    winsorized,
+                    stats: {
+                        total: data.length,
+                        outliers: combinedOutliers.size,
+                        pctOutliers: (combinedOutliers.size / data.length * 100).toFixed(1)
+                    }
+                };
+            }
+        }
+
+        /**
+         * ROBUST REGRESSION CLASS
+         * Purpose: Fits regression lines that are resistant to outlier influence
+         * Implements Huber regression for robust trend estimation
+         */
+        class RobustRegression {
+            /**
+             * Huber Regression Implementation
+             * Iteratively reweighted least squares with Huber loss function
+             * More robust to outliers than ordinary least squares
+             * @param {number[]} xs - X coordinates (typically time indices)
+             * @param {number[]} ys - Y coordinates (data values)
+             * @param {number} c - Huber parameter (default 1.35)
+             * @param {number} maxIter - Maximum iterations (default 100)
+             * @param {number} tol - Convergence tolerance (default 1e-6)
+             * @returns {Object} Regression slope and intercept
+             */
+            static huberRegression(xs, ys, c = 1.35, maxIter = 100, tol = 1e-6) {
+                if (xs.length !== ys.length || xs.length < 2) 
+                    return { slope: 0, intercept: ys[ys.length - 1] || 0 };
+                
+                // Start with ordinary least squares as initial estimate
+                let { slope, intercept } = this.ordinaryLeastSquares(xs, ys);
+                const n = xs.length;
+                
+                // Iterative reweighting process
+                for (let iter = 0; iter < maxIter; iter++) {
+                    // Calculate residuals from current fit
+                    const residuals = ys.map((y, i) => y - (intercept + slope * xs[i]));
+                    
+                    // Estimate scale using median absolute deviation
+                    const mad = OutlierDetector.percentile(residuals.map(Math.abs).sort((a, b) => a - b), 50);
+                    const sigma = 1.4826 * mad; // Scale factor for normal distribution
+                    
+                    if (sigma < tol) break; // Converged
+                    
+                    // Calculate Huber weights: full weight for small residuals, reduced for large
+                    const weights = residuals.map(r => {
+                        const u = Math.abs(r / sigma);
+                        return u <= c ? 1 : c / u; // Huber weight function
+                    });
+                    
+                    // Fit weighted least squares with current weights
+                    const { slope: newSlope, intercept: newIntercept } = this.weightedLeastSquares(xs, ys, weights);
+                    
+                    // Check for convergence
+                    if (Math.abs(newSlope - slope) < tol && Math.abs(newIntercept - intercept) < tol) break;
+                    
+                    slope = newSlope;
+                    intercept = newIntercept;
+                }
+                
+                return { slope, intercept };
+            }
+            
+            /**
+             * Standard Ordinary Least Squares Regression
+             * @param {number[]} xs - X coordinates
+             * @param {number[]} ys - Y coordinates
+             * @returns {Object} Slope and intercept
+             */
+            static ordinaryLeastSquares(xs, ys) {
+                const n = xs.length;
+                const sumX = xs.reduce((a, b) => a + b, 0);
+                const sumY = ys.reduce((a, b) => a + b, 0);
+                const sumXY = xs.reduce((sum, x, i) => sum + x * ys[i], 0);
+                const sumXX = xs.reduce((sum, x) => sum + x * x, 0);
+                
+                // Standard least squares formulas
+                const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+                const intercept = (sumY - slope * sumX) / n;
+                
+                return { slope, intercept };
+            }
+            
+            /**
+             * Weighted Least Squares Regression
+             * @param {number[]} xs - X coordinates
+             * @param {number[]} ys - Y coordinates
+             * @param {number[]} weights - Weights for each observation
+             * @returns {Object} Slope and intercept
+             */
+            static weightedLeastSquares(xs, ys, weights) {
+                const sumW = weights.reduce((a, b) => a + b, 0);
+                const sumWX = weights.reduce((sum, w, i) => sum + w * xs[i], 0);
+                const sumWY = weights.reduce((sum, w, i) => sum + w * ys[i], 0);
+                const sumWXY = weights.reduce((sum, w, i) => sum + w * xs[i] * ys[i], 0);
+                const sumWXX = weights.reduce((sum, w, i) => sum + w * xs[i] * xs[i], 0);
+                
+                // Weighted least squares formulas
+                const slope = (sumW * sumWXY - sumWX * sumWY) / (sumW * sumWXX - sumWX * sumWX);
+                const intercept = (sumWY - slope * sumWX) / sumW;
+                
+                return { slope, intercept };
+            }
+        }
+
+        /**
+         * AUTOCORRELATION TESTING CLASS
+         * Purpose: Tests for serial correlation in time series residuals
+         * Used to determine if autoregressive modeling is needed
+         */
+        class AutocorrelationTester {
+            /**
+             * Calculate autocorrelation at specified lag
+             * @param {number[]} r - Residual series
+             * @param {number} lag - Lag period to test
+             * @returns {number} Autocorrelation coefficient
+             */
+            static calcAC(r, lag) {
+                const n = r.length; 
+                if (lag >= n || lag < 1) return 0;
+                
+                const m = r.reduce((a,b)=>a+b,0)/n; // Mean of residuals
+                let num = 0, den = 0;
+                
+                // Calculate numerator: covariance at lag
+                for(let i = lag; i < n; i++) num += (r[i] - m) * (r[i - lag] - m);
+                
+                // Calculate denominator: variance
+                for(let i = 0; i < n; i++) den += (r[i] - m) ** 2;
+                
+                return den !== 0 ? num / den : 0;
+            }
+            
+            /**
+             * Ljung-Box Test for Serial Correlation
+             * Tests null hypothesis that residuals are independently distributed
+             * @param {number[]} r - Residual series
+             * @param {number} maxLag - Maximum lag to test
+             * @returns {Object} Test statistic and significance
+             */
+            static ljungBox(r, maxLag = Math.min(10, Math.floor(r.length/4))) {
+                const n = r.length; 
+                if (n < maxLag + 2) return {statistic: 0, pValue: 1, significant: false};
+                
+                // Calculate Ljung-Box statistic
+                let stat = 0; 
+                for(let k = 1; k <= maxLag; k++) { 
+                    const rk = this.calcAC(r, k); 
+                    stat += (rk * rk) / (n - k); // Weighted sum of squared autocorrelations
+                }
+                stat *= n * (n + 2); // Ljung-Box adjustment
+                
+                // Critical values for different degrees of freedom (approximate)
+                const crit = [0,3.84,5.99,7.81,9.49,11.07,12.59,14.07,15.51,16.92,18.31][Math.min(maxLag,10)] || 18.31;
+                
+                return {
+                    statistic: stat,
+                    criticalValue: crit,
+                    significant: stat > crit, // Reject independence if statistic exceeds critical value
+                    maxLag
+                };
+            }
+        }
+
+        /**
+         * AUTOREGRESSIVE MODEL CLASS
+         * Purpose: Fits AR(p) models to capture temporal dependencies in residuals
+         * Automatically selects optimal order using AIC criterion
+         */
+        class ARModel {
+            /**
+             * Initialize AR model with maximum order constraint
+             * @param {number} maxOrder - Maximum AR order to consider (default 3)
+             */
+            constructor(maxOrder = 3) { 
+                this.maxOrder = maxOrder; 
+                this.coefficients = []; 
+                this.order = 0; 
+                this.sigma = 0; 
+            }
+            
+            /**
+             * Fit AR model to residual series using AIC model selection
+             * @param {number[]} r - Residual series to model
+             */
+            fit(r) {
+                const n = r.length; 
+                if(n < this.maxOrder + 2) { 
+                    // Insufficient data for AR modeling
+                    this.order = 0; 
+                    this.coefficients = []; 
+                    this.sigma = this.calcSE(r); 
+                    return; 
+                }
+                
+                // Try different AR orders and select best by AIC
+                let bestOrder = 0, bestAIC = Infinity, bestCoeffs = [], bestSigma = 0;
+                for(let p = 0; p <= this.maxOrder; p++) {
+                    if(n < p + 2) continue; 
+                    
+                    const res = this.fitAR(r, p);
+                    const aic = this.calcAIC(r, res.coefficients, res.sigma);
+                    
+                    if(aic < bestAIC) { 
+                        bestAIC = aic; 
+                        bestOrder = p; 
+                        bestCoeffs = res.coefficients; 
+                        bestSigma = res.sigma; 
+                    }
+                }
+                
+                // Store best model
+                this.order = bestOrder; 
+                this.coefficients = bestCoeffs; 
+                this.sigma = bestSigma;
+            }
+            
+            /**
+             * Fit AR model of specified order
+             * @param {number[]} r - Residual series
+             * @param {number} order - AR order to fit
+             * @returns {Object} Fitted coefficients and error variance
+             */
+            fitAR(r, order) {
+                if(order === 0) return {coefficients: [], sigma: this.calcSE(r)};
+                
+                const n = r.length;
+                const X = [], y = []; // Design matrix and response vector
+                
+                // Build autoregressive design matrix
+                for(let i = order; i < n; i++) { 
+                    const row = []; 
+                    for(let j = 1; j <= order; j++) row.push(r[i - j]); // Lagged values
+                    X.push(row); 
+                    y.push(r[i]); // Current value
+                }
+                
+                // Solve normal equations for AR coefficients
+                const coeffs = this.solveNE(X, y);
+                const preds = this.predAR(r, coeffs);
+                const errs = y.map((v, i) => v - preds[i]);
+                
+                return {coefficients: coeffs, sigma: this.calcSE(errs)};
+            }
+            
+            /**
+             * Solve normal equations X'X β = X'y
+             * @param {number[][]} X - Design matrix
+             * @param {number[]} y - Response vector
+             * @returns {number[]} Coefficient estimates
+             */
+            solveNE(X, y) {
+                const n = X.length, p = X[0].length; 
+                if(n === 0 || p === 0) return [];
+                
+                // Form normal equations
+                const XTX = Array(p).fill().map(() => Array(p).fill(0));
+                const XTy = Array(p).fill(0);
+                
+                for(let i = 0; i < n; i++) { 
+                    for(let j = 0; j < p; j++) { 
+                        XTy[j] += X[i][j] * y[i]; 
+                        for(let k = 0; k < p; k++) XTX[j][k] += X[i][j] * X[i][k]; 
+                    } 
+                }
+                
+                return this.gaussElim(XTX, XTy);
+            }
+            
+            /**
+             * Gaussian elimination for solving linear system
+             * @param {number[][]} A - Coefficient matrix
+             * @param {number[]} b - Right-hand side vector
+             * @returns {number[]} Solution vector
+             */
+            gaussElim(A, b) {
+                const n = A.length;
+                const aug = A.map((row, i) => [...row, b[i]]); // Augmented matrix
+                
+                // Forward elimination with partial pivoting
+                for(let i = 0; i < n; i++) {
+                    // Find pivot row
+                    let maxRow = i; 
+                    for(let k = i + 1; k < n; k++) 
+                        if(Math.abs(aug[k][i]) > Math.abs(aug[maxRow][i])) maxRow = k;
+                    
+                    // Swap rows
+                    [aug[i], aug[maxRow]] = [aug[maxRow], aug[i]];
+                    
+                    // Eliminate column
+                    for(let k = i + 1; k < n; k++) { 
+                        if(Math.abs(aug[i][i]) < 1e-10) continue; 
+                        const f = aug[k][i] / aug[i][i]; 
+                        for(let j = i; j <= n; j++) aug[k][j] -= f * aug[i][j]; 
+                    }
+                }
+                
+                // Back substitution
+                const sol = Array(n).fill(0); 
+                for(let i = n - 1; i >= 0; i--) { 
+                    sol[i] = aug[i][n]; 
+                    for(let j = i + 1; j < n; j++) sol[i] -= aug[i][j] * sol[j]; 
+                    if(Math.abs(aug[i][i]) > 1e-10) sol[i] /= aug[i][i]; 
+                }
+                
+                return sol;
+            }
+            
+            /**
+             * Generate AR predictions for fitted coefficients
+             * @param {number[]} r - Original residual series
+             * @param {number[]} coeffs - AR coefficients
+             * @returns {number[]} Predicted values
+             */
+            predAR(r, coeffs) { 
+                if(coeffs.length === 0) return []; 
+                const ord = coeffs.length;
+                const preds = []; 
+                
+                for(let i = ord; i < r.length; i++) { 
+                    let pred = 0; 
+                    for(let j = 0; j < ord; j++) pred += coeffs[j] * r[i - 1 - j]; 
+                    preds.push(pred); 
+                } 
+                
+                return preds; 
+            }
+            
+            /**
+             * Calculate Akaike Information Criterion
+             * @param {number[]} r - Residual series
+             * @param {number[]} coeffs - Model coefficients
+             * @param {number} sig - Error standard deviation
+             * @returns {number} AIC value (lower is better)
+             */
+            calcAIC(r, coeffs, sig) { 
+                return r.length * Math.log(sig * sig) + 2 * coeffs.length; 
+            }
+            
+            /**
+             * Calculate standard error of residuals
+             * @param {number[]} r - Residual series
+             * @returns {number} Standard error
+             */
+            calcSE(r) { 
+                if(r.length <= 1) return 1; 
+                const m = r.reduce((a,b) => a + b, 0) / r.length;
+                const v = r.reduce((s, val) => s + (val - m) ** 2, 0) / (r.length - 1); 
+                return Math.sqrt(v); 
+            }
+            
+            /**
+             * Generate multi-step ahead forecasts
+             * @param {number[]} r - Historical residual series
+             * @param {number} steps - Number of forecast steps
+             * @returns {number[]} Forecast values
+             */
+            forecast(r, steps) {
+                if(this.order === 0) return Array(steps).fill(0); 
+                
+                const forecasts = [];
+                const lastR = r.slice(-this.order); // Most recent residuals for AR
+                
+                for(let i = 0; i < steps; i++) { 
+                    let f = 0; 
+                    // Apply AR coefficients to recent values
+                    for(let j = 0; j < this.order; j++) { 
+                        const idx = lastR.length - 1 - j; 
+                        if(idx >= 0) f += this.coefficients[j] * lastR[idx]; 
+                    } 
+                    
+                    forecasts.push(f); 
+                    lastR.push(f); // Add forecast to history for next step
+                    if(lastR.length > this.order) lastR.shift(); // Maintain window size
+                }
+                
+                return forecasts;
+            }
+        }
+
+        /**
+         * TIME SERIES VALIDATION CLASS
+         * Purpose: Validates forecasting performance using walk-forward cross-validation
+         * Provides metrics to assess forecast accuracy and reliability
+         */
+        class TimeSeriesValidator {
+            /**
+             * Calculate forecast accuracy metrics
+             * @param {number[]} actual - Actual observed values
+             * @param {number[]} forecast - Forecasted values
+             * @returns {Object} MAE, RMSE, MAPE, MASE metrics
+             */
+            static calcMetrics(actual, forecast) {
+                const n = Math.min(actual.length, forecast.length);
+                if (n === 0) return { mae: 0, rmse: 0, mape: 0, mase: 0 };
+                
+                let mae = 0, mse = 0, mape = 0;
+                for (let i = 0; i < n; i++) {
+                    const err = Math.abs(actual[i] - forecast[i]);
+                    mae += err; // Mean Absolute Error
+                    mse += err * err; // Mean Squared Error
+                    if (actual[i] !== 0) mape += Math.abs(err / actual[i]); // Mean Absolute Percentage Error
+                }
+                
+                mae /= n; 
+                mse /= n; 
+                mape = (mape / n) * 100;
+                const rmse = Math.sqrt(mse); // Root Mean Squared Error
+                
+                // Calculate MASE (Mean Absolute Scaled Error) using naive forecast as benchmark
+                let naiveMAE = 0;
+                for (let i = 1; i < actual.length; i++) {
+                    naiveMAE += Math.abs(actual[i] - actual[i-1]); // Naive forecast = previous value
+                }
+                naiveMAE /= (actual.length - 1);
+                const mase = naiveMAE !== 0 ? mae / naiveMAE : 0; // MASE < 1 means better than naive
+                
+                return { mae, rmse, mape, mase };
+            }
+            
+            /**
+             * Walk-Forward Cross-Validation
+             * Simulates real-world forecasting by training on past data and testing on future
+             * @param {string} oui - OUI identifier
+             * @param {number[]} ys - Time series values
+             * @param {string[]} dates - Corresponding dates
+             * @param {number} minTrainSize - Minimum training set size
+             * @param {number} testHorizon - Forecast horizon length
+             * @param {number} numFolds - Number of validation folds
+             * @returns {Object} Validation results with average metrics
+             */
+            static walkForwardValidation(oui, ys, dates, minTrainSize = 30, testHorizon = 7, numFolds = 5) {
+                if (ys.length < minTrainSize + testHorizon) return null;
+                
+                const maxStartIdx = ys.length - testHorizon - minTrainSize;
+                const stepSize = Math.max(1, Math.floor(maxStartIdx / numFolds));
+                const folds = [];
+                
+                // Create multiple train/test splits moving forward in time
+                for (let fold = 0; fold < numFolds; fold++) {
+                    const trainEndIdx = minTrainSize + fold * stepSize;
+                    if (trainEndIdx + testHorizon > ys.length) break;
+                    
+                    // Split data: train on past, test on future
+                    const trainYs = ys.slice(0, trainEndIdx);
+                    const trainDates = dates.slice(0, trainEndIdx);
+                    const testYs = ys.slice(trainEndIdx, trainEndIdx + testHorizon);
+                    
+                    try {
+                        // Generate forecast using training data only
+                        const forecast = buildProjection(oui, trainYs, trainDates, testHorizon);
+                        const metrics = this.calcMetrics(testYs, forecast);
+                        folds.push({ fold, trainSize: trainEndIdx, testSize: testHorizon, metrics });
+                    } catch (e) {
+                        continue; // Skip folds that fail
+                    }
+                }
+                
+                if (folds.length === 0) return null;
+                
+                // Average metrics across all folds
+                const avgMetrics = { mae: 0, rmse: 0, mape: 0, mase: 0 };
+                folds.forEach(f => {
+                    avgMetrics.mae += f.metrics.mae;
+                    avgMetrics.rmse += f.metrics.rmse;
+                    avgMetrics.mape += f.metrics.mape;
+                    avgMetrics.mase += f.metrics.mase;
+                });
+                
+                Object.keys(avgMetrics).forEach(k => avgMetrics[k] /= folds.length);
+                
+                return { avgMetrics, folds: folds.length, minTrainSize, testHorizon };
+            }
+            
+            /**
+             * Validate forecasting performance across multiple OUIs
+             * @param {Object} dailyGrouped - Daily aggregated data by OUI
+             * @param {string[]} allDates - Array of date strings
+             * @param {string[]} sortedOuis - OUIs sorted by importance
+             * @returns {Object} Comprehensive validation results
+             */
+            static validateAllOUIs(dailyGrouped, allDates, sortedOuis) {
+                const results = {};
+                let totalValidated = 0, totalFolds = 0, totalOutliers = 0, totalPoints = 0;
+                
+                // Validate top 10 OUIs for performance assessment
+                sortedOuis.slice(0, 10).forEach(oui => {
+                    const ys = allDates.map(date => dailyGrouped[date] && dailyGrouped[date][oui] || 0);
+                    const outlierInfo = OutlierDetector.detectCombined(ys, allDates);
+                    totalOutliers += outlierInfo.stats.outliers;
+                    totalPoints += outlierInfo.stats.total;
+                    
+                    const validation = this.walkForwardValidation(oui, ys, allDates);
+                    
+                    if (validation) {
+                        results[oui] = { ...validation, outlierInfo };
+                        totalValidated++;
+                        totalFolds += validation.folds;
+                    }
+                });
+                
+                return { 
+                    results, 
+                    totalValidated, 
+                    totalFolds, 
+                    outlierStats: { 
+                        total: totalOutliers, 
+                        points: totalPoints, 
+                        pct: (totalOutliers / totalPoints * 100).toFixed(1) 
+                    } 
+                };
+            }
+        }
+
+        /**
+         * SEASONALITY DETECTION CLASS
+         * Purpose: Identifies and models seasonal patterns in time series data
+         * Handles holidays, day-of-week effects, monthly patterns, and quarterly cycles
+         */
+        class SeasonalityDetector {
+            /**
+             * Generate set of major holidays for given year
+             * @param {number} year - Year to generate holidays for
+             * @returns {Set} Set of holiday date strings (YYYY-MM-DD)
+             */
+            static getHolidays(year) {
+                const holidays = new Set();
+                const easterSunday = this.getEaster(year);
+                const memorialDay = this.getNthWeekdayOfMonth(year, 4, 1, -1); // Last Monday in May
+                const laborDay = this.getNthWeekdayOfMonth(year, 8, 1, 1); // First Monday in September
+                const thanksgiving = this.getNthWeekdayOfMonth(year, 10, 4, 4); // 4th Thursday in November
+                
+                // Add major holidays
+                [
+                    `${year}-01-01`, // New Year's Day
+                    `${year}-07-04`, // Independence Day
+                    `${year}-12-25`, // Christmas Day
+                    easterSunday, 
+                    memorialDay, 
+                    laborDay, 
+                    thanksgiving,
+                    this.addDays(thanksgiving, 1) // Black Friday
+                ].forEach(h => holidays.add(h));
+                
+                return holidays;
+            }
+            
+            /**
+             * Calculate Easter Sunday using astronomical algorithm
+             * @param {number} year - Year to calculate Easter for
+             * @returns {string} Easter date string (YYYY-MM-DD)
+             */
+            static getEaster(year) {
+                // Anonymous Gregorian algorithm for Easter calculation
+                const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+                const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+                const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+                const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7;
+                const m = Math.floor((a + 11 * h + 22 * l) / 451), n = Math.floor((h + l - 7 * m + 114) / 31);
+                const p = (h + l - 7 * m + 114) % 31;
+                return `${year}-${n.toString().padStart(2,'0')}-${(p + 1).toString().padStart(2,'0')}`;
+            }
+            
+            /**
+             * Find nth weekday of month (e.g., 2nd Tuesday, last Friday)
+             * @param {number} year - Year
+             * @param {number} month - Month (0-11)
+             * @param {number} weekday - Day of week (0=Sunday, 6=Saturday)
+             * @param {number} n - Which occurrence (positive from start, negative from end)
+             * @returns {string} Date string (YYYY-MM-DD)
+             */
+            static getNthWeekdayOfMonth(year, month, weekday, n) {
+                const firstDay = new Date(year, month, 1);
+                const firstWeekday = firstDay.getDay();
+                const offset = (weekday - firstWeekday + 7) % 7;
+                let day = 1 + offset + (n > 0 ? (n - 1) * 7 : 0);
+                
+                if (n < 0) {
+                    // Count from end of month
+                    const lastDay = new Date(year, month + 1, 0).getDate();
+                    day = lastDay - ((firstWeekday + lastDay - 1 - weekday) % 7) + n * 7;
+                }
+                
+                return `${year}-${(month + 1).toString().padStart(2,'0')}-${day.toString().padStart(2,'0')}`;
+            }
+            
+            /**
+             * Add days to date string
+             * @param {string} dateStr - Initial date (YYYY-MM-DD)
+             * @param {number} days - Days to add
+             * @returns {string} New date string
+             */
+            static addDays(dateStr, days) {
+                const d = new Date(dateStr); 
+                d.setDate(d.getDate() + days);
+                return d.toISOString().slice(0, 10);
+            }
+            
+            /**
+             * Check if date is a holiday
+             * @param {string} dateStr - Date to check (YYYY-MM-DD)
+             * @returns {boolean} True if holiday
+             */
+            static isHoliday(dateStr) {
+                const year = new Date(dateStr).getFullYear();
+                return this.getHolidays(year).has(dateStr);
+            }
+            
+            /**
+             * Extract seasonal factors from time series data
+             * Groups data by various seasonal categories for analysis
+             * @param {string[]} dates - Array of date strings
+             * @param {number[]} values - Corresponding values
+             * @returns {Object} Seasonal factor groups
+             */
+            static getSeasonalFactors(dates, values) {
+                const factors = { 
+                    dow: Array(7).fill().map(() => []), // Day of week (0=Sunday)
+                    moy: Array(12).fill().map(() => []), // Month of year (0=January)
+                    holiday: [], // Holiday values
+                    regular: [], // Non-holiday values
+                    quarter: Array(4).fill().map(() => []) // Quarterly (0=Q1)
+                };
+                
+                dates.forEach((date, i) => {
+                    const d = new Date(date);
+                    const dow = d.getDay(), moy = d.getMonth(), quarter = Math.floor(moy / 3);
+                    const isHol = this.isHoliday(date);
+                    
+                    // Categorize each observation
+                    factors.dow[dow].push(values[i]);
+                    factors.moy[moy].push(values[i]);
+                    factors.quarter[quarter].push(values[i]);
+                    (isHol ? factors.holiday : factors.regular).push(values[i]);
+                });
+                
+                return factors;
+            }
+            
+            /**
+             * Calculate mean of array
+             * @param {number[]} arr - Array of numbers
+             * @returns {number} Mean value
+             */
+            static calcMean(arr) { 
+                return arr.length > 0 ? arr.reduce((a,b) => a+b, 0) / arr.length : 0; 
+            }
+            
+            /**
+             * Calculate seasonal adjustments as deviations from global mean
+             * @param {Object} factors - Seasonal factor groups
+             * @param {number} globalMean - Overall mean of the series
+             * @returns {Object} Seasonal adjustment factors
+             */
+            static getSeasonalAdjustments(factors, globalMean) {
+                const adj = {
+                    dow: factors.dow.map(vals => this.calcMean(vals) - globalMean), // Day-of-week effects
+                    moy: factors.moy.map(vals => this.calcMean(vals) - globalMean), // Monthly effects
+                    quarter: factors.quarter.map(vals => this.calcMean(vals) - globalMean), // Quarterly effects
+                    holiday: this.calcMean(factors.holiday) - globalMean, // Holiday effect
+                    regular: globalMean // Baseline for non-holidays
+                };
+                return adj;
+            }
+        }
+
+        /**
+         * BOOTSTRAP SAMPLING CLASS
+         * Purpose: Generates random samples from historical data for uncertainty modeling
+         * Implements block bootstrap to preserve temporal structure
+         */
+        class BootstrapSampler {
+            /**
+             * Initialize bootstrap sampler
+             * @param {number[]} data - Historical data to sample from
+             * @param {number} blockSize - Size of temporal blocks (default 1)
+             * @param {number} seed - Random seed for reproducibility
+             */
+            constructor(data, blockSize = 1, seed = Date.now()) { 
+                this.data = data; 
+                this.blockSize = Math.min(blockSize, data.length); 
+                this.rng = new SeededRandom(seed); 
+            }
+            
+            /**
+             * Draw random sample from historical data
+             * Uses block sampling to preserve short-term temporal dependencies
+             * @returns {number} Sampled value
+             */
+            sample() {
+                if(this.data.length === 0) return 0; 
+                if(this.data.length === 1) return this.data[0];
+                
+                if(this.blockSize === 1) {
+                    // Simple random sampling
+                    return this.data[this.rng.randInt(0, this.data.length - 1)];
+                }
+                
+                // Block bootstrap: sample a block then pick random element from it
+                const blockStart = this.rng.randInt(0, this.data.length - this.blockSize);
+                const blockIdx = this.rng.randInt(0, this.blockSize - 1);
+                return this.data[blockStart + blockIdx];
+            }
+        }
+
+        /**
+         * UTILITY FUNCTIONS
+         * Purpose: Helper functions for data processing and basic calculations
+         */
+        
+        /**
+         * Aggregate hourly data to daily totals by OUI
+         * @param {Object[]} raw - Raw hourly data records
+         * @returns {Object} Daily aggregated data {date: {oui: total}}
+         */
+        const aggregateToDaily = raw => { 
+            const agg = {}; 
+            raw.forEach(row => {
+                const day = row['block_hour'].slice(0, 10); // Extract date from timestamp
+                if(!agg[day]) agg[day] = {}; 
+                agg[day][row['oui']] = (agg[day][row['oui']] || 0) + Number(row['dc_burned'] || 0);
+            }); 
+            return agg; 
+        };
+        
+        /**
+         * Add days to date string
+         * @param {string} dateStr - Initial date
+         * @param {number} days - Days to add
+         * @returns {string} New date string
+         */
+        const addDays = (dateStr, days) => { 
+            const d = new Date(dateStr); 
+            d.setUTCDate(d.getUTCDate() + days); 
+            return d.toISOString().slice(0, 10); 
+        };
+        
+        // Date utility functions
+        const getDayOfWeek = dateStr => new Date(dateStr).getDay();
+        const getMonth = dateStr => new Date(dateStr).getMonth();
+        const getQuarter = dateStr => Math.floor(new Date(dateStr).getMonth() / 3);
+        
+        /**
+         * Simple linear regression
+         * @param {number[]} xs - X values
+         * @param {number[]} ys - Y values
+         * @returns {Object} Slope and intercept
+         */
+        const linreg = (xs, ys) => { 
+            const n = xs.length; 
+            if(n < 2) return {slope: 0, intercept: ys[ys.length-1] || 0}; 
+            
+            const sumx = xs.reduce((a,b) => a+b, 0);
+            const sumy = ys.reduce((a,b) => a+b, 0);
+            const xbar = sumx / n, ybar = sumy / n; 
+            
+            let num = 0, den = 0; 
+            for(let i = 0; i < n; i++){
+                num += (xs[i] - xbar) * (ys[i] - ybar);
+                den += (xs[i] - xbar) ** 2;
+            } 
+            
+            return {slope: den !== 0 ? num/den : 0, intercept: ybar - (den !== 0 ? num/den : 0) * xbar}; 
+        };
+
+        /**
+         * COMPREHENSIVE SEASONAL MODEL BUILDER
+         * Purpose: Main function that orchestrates the complete time series decomposition
+         * and modeling process combining all the advanced techniques
+         */
+        function buildComprehensiveSeasonalModel(ys, dates) {
+            // Step 1: Outlier Detection and Handling
+            // Detect outliers using multiple methods and decide on cleaning strategy
+            const outlierInfo = OutlierDetector.detectCombined(ys, dates);
+            
+            // Choose cleaning strategy based on outlier percentage
+            // If >10% outliers, use winsorization; otherwise use original data
+            const cleanedYs = outlierInfo.outliers.size > ys.length * 0.1 ? 
+                outlierInfo.winsorized : ys;
+            
+            // Step 2: Trend Estimation
+            // Create time index for regression
+            const xs = Array.from({length: cleanedYs.length}, (_, i) => i);
+            
+            // Choose regression method based on outlier prevalence
+            // If >5% outliers, use robust Huber regression; otherwise use OLS
+            const reg = outlierInfo.outliers.size > ys.length * 0.05 ? 
+                RobustRegression.huberRegression(xs, cleanedYs) : 
+                linreg(xs, cleanedYs);
+            
+            // Step 3: Detrending
+            // Remove linear trend to focus on seasonal and residual components
+            const trendRemoved = cleanedYs.map((y, i) => y - (reg.intercept + reg.slope * i));
+            const globalMean = trendRemoved.reduce((a,b) => a+b, 0) / trendRemoved.length;
+            
+            // Step 4: Seasonal Pattern Extraction
+            // Group detrended data by seasonal factors
+            const factors = SeasonalityDetector.getSeasonalFactors(dates, trendRemoved);
+            const seasonalAdj = SeasonalityDetector.getSeasonalAdjustments(factors, globalMean);
+            
+            // Step 5: Residual Calculation
+            // Remove all systematic patterns (trend + seasonality) to get pure residuals
+            const residuals = trendRemoved.map((val, i) => {
+                const date = dates[i], d = new Date(date);
+                const dow = d.getDay(), moy = d.getMonth(), quarter = Math.floor(moy / 3);
+                const isHol = SeasonalityDetector.isHoliday(date);
+                
+                // Apply all seasonal adjustments
+                let seasonal = seasonalAdj.dow[dow] + seasonalAdj.moy[moy] + seasonalAdj.quarter[quarter];
+                seasonal += isHol ? seasonalAdj.holiday : 0;
+                
+                return val - seasonal; // Pure residual after removing all patterns
+            });
+            
+            // Step 6: Context-Specific Residual Modeling
+            // Model residuals differently for different temporal contexts
+            let deltasByContext = {}, arModelsByContext = {};
+            const contexts = ['weekday', 'weekend', 'holiday', 'month_start', 'month_end'];
+            contexts.forEach(ctx => { 
+                deltasByContext[ctx] = []; 
+                arModelsByContext[ctx] = new ARModel(); 
+            });
+            
+            // Categorize residuals by temporal context
+            residuals.forEach((res, i) => {
+                const date = dates[i], d = new Date(date), dow = d.getDay(), day = d.getDate();
+                const isWeekend = dow === 0 || dow === 6, isHol = SeasonalityDetector.isHoliday(date);
+                const isMonthStart = day <= 5, isMonthEnd = day > 25;
+                
+                // Determine primary context for this observation
+                let context = isHol ? 'holiday' : isWeekend ? 'weekend' : 'weekday';
+                if (isMonthStart) context = 'month_start';
+                if (isMonthEnd) context = 'month_end';
+                
+                deltasByContext[context].push(res);
+            });
+            
+            // Step 7: Autoregressive Modeling by Context
+            // Fit separate AR models for different contexts if sufficient data and correlation
+            Object.keys(arModelsByContext).forEach(ctx => {
+                if (deltasByContext[ctx].length > 5) {
+                    // Clean context-specific residuals
+                    const cleanedDeltas = OutlierDetector.detectCombined(deltasByContext[ctx], dates).cleaned;
+                    if (cleanedDeltas.length > 5) {
+                        deltasByContext[ctx] = cleanedDeltas;
+                        
+                        // Test for autocorrelation before fitting AR model
+                        const ljRes = AutocorrelationTester.ljungBox(cleanedDeltas);
+                        if (ljRes.significant) {
+                            arModelsByContext[ctx].fit(cleanedDeltas); // Only fit AR if autocorrelation detected
+                        }
+                    }
+                }
+            });
+            
+            return { deltasByContext, arModelsByContext, regression: reg, seasonalAdj, outlierInfo };
+        }
+
+        /**
+         * MAIN PROJECTION FUNCTION
+         * Purpose: Generates future projections using the comprehensive seasonal model
+         * Combines trend, seasonality, autoregressive effects, and stochastic innovation
+         */
+        function buildProjection(oui, ys, dates, projDays) {
+            // Build comprehensive model using all historical data
+            const { deltasByContext, arModelsByContext, regression, seasonalAdj } = 
+                buildComprehensiveSeasonalModel(ys, dates);
+            
+            const lastX = ys.length - 1; // Last time index for trend extrapolation
+            
+            // Step 1: Initialize Bootstrap Samplers for Each Context
+            // Create separate samplers for different temporal contexts with OUI-specific seeds
+            const samplers = {};
+            Object.keys(deltasByContext).forEach(ctx => {
+                // Generate reproducible seed from OUI string and context
+                const seed = oui.split('').reduce((a,b) => a + b.charCodeAt(0), 0) + ctx.length * 1000;
+                let sampleData = deltasByContext[ctx];
+                
+                // If AR model exists, sample from AR residuals rather than raw residuals
+                if (arModelsByContext[ctx].order > 0) {
+                    const arPreds = arModelsByContext[ctx].predAR(sampleData, arModelsByContext[ctx].coefficients);
+                    sampleData = sampleData.slice(arModelsByContext[ctx].order).map((val, i) => val - arPreds[i]);
+                }
+                
+                // Use block bootstrap to preserve short-term dependencies
+                const blockSize = Math.max(1, Math.min(3, Math.floor(sampleData.length / 4)));
+                samplers[ctx] = new BootstrapSampler(sampleData, blockSize, seed);
+            });
+            
+            // Step 2: Initialize AR State for Each Context
+            // Keep track of recent residuals for AR forecasting
+            const lastResidualsByContext = {};
+            Object.keys(deltasByContext).forEach(ctx => {
+                lastResidualsByContext[ctx] = arModelsByContext[ctx].order > 0 ? 
+                    deltasByContext[ctx].slice(-arModelsByContext[ctx].order) : [];
+            });
+            
+            // Step 3: Generate Multi-Step Projections
+            const proj = [];
+            for (let i = 1; i <= projDays; i++) {
+                const t = lastX + i; // Future time index
+                const dt = addDays(dates[dates.length - 1], i); // Future date
+                const d = new Date(dt);
+                const dow = d.getDay(), moy = d.getMonth(), quarter = Math.floor(moy / 3), day = d.getDate();
+                const isWeekend = dow === 0 || dow === 6, isHol = SeasonalityDetector.isHoliday(dt);
+                const isMonthStart = day <= 5, isMonthEnd = day > 25;
+                
+                // Determine context for this future date
+                let context = isHol ? 'holiday' : isWeekend ? 'weekend' : 'weekday';
+                if (isMonthStart) context = 'month_start';
+                if (isMonthEnd) context = 'month_end';
+                
+                // Step 3a: Calculate Base Trend
+                const base = regression.intercept + regression.slope * t;
+                
+                // Step 3b: Add Seasonal Effects
+                let seasonal = seasonalAdj.dow[dow] + seasonalAdj.moy[moy] + seasonalAdj.quarter[quarter];
+                seasonal += isHol ? seasonalAdj.holiday : 0;
+                
+                // Step 3c: Generate Stochastic Component
+                let delta = 0;
+                if (arModelsByContext[context].order > 0) {
+                    // Use AR forecast + bootstrap innovation
+                    const arF = arModelsByContext[context].forecast(lastResidualsByContext[context], 1)[0] || 0;
+                    const innov = samplers[context].sample(); // Random innovation
+                    delta = arF + innov;
+                    
+                    // Update AR state for next step
+                    lastResidualsByContext[context].push(delta);
+                    if (lastResidualsByContext[context].length > arModelsByContext[context].order) {
+                        lastResidualsByContext[context].shift();
+                    }
+                } else {
+                    // Use bootstrap sample directly if no AR structure
+                    delta = samplers[context].sample();
+                }
+                
+                // Step 3d: Combine All Components
+                // Ensure non-negative forecast (DC burned cannot be negative)
+                proj.push(Math.max(0, base + seasonal + delta));
+            }
+            
+            return proj;
+        }
+
+        /**
+         * CUSTOM DATA PROCESSING FOR CHARTS
+         * Purpose: Prepares custom data for Plotly hover information
+         * Calculates daily totals across all OUIs for enhanced chart tooltips
+         */
+        const barCustomData = (byOUI, allDates) => { 
+            // Calculate daily totals across all OUIs
+            const totals = Array(allDates.length).fill(0); 
+            Object.values(byOUI).forEach(vals => {
+                vals.forEach((v, i) => {totals[i] += v})
+            }); 
+            
+            // Format totals for custom data (Plotly expects array of arrays)
+            const cdByOUI = {}; 
+            Object.keys(byOUI).forEach(oui => {
+                cdByOUI[oui] = totals.map(x => [x])
+            }); 
+            
+            return cdByOUI; 
+        };
+
+        /**
+         * MAIN CHART PLOTTING FUNCTION
+         * Purpose: Creates three interactive charts showing historical data, projections, and combined view
+         * Uses validation results to display forecast performance metrics
+         */
+        function plotCharts(histDays, projDays, comboHistDays, comboProjDays, dailyGrouped, allDatesFull, sortedOuis, validationResults) {
+            // Remove last date (typically incomplete) for historical analysis
+            const allDates = allDatesFull.slice(0, -1), omittedDate = allDatesFull[allDatesFull.length - 1];
+            
+            // Display validation results if available
+            if (validationResults) {
+                const { results, totalValidated, totalFolds, outlierStats } = validationResults;
+                const avgMAE = Object.values(results).reduce((sum, r) => sum + r.avgMetrics.mae, 0) / totalValidated;
+                const avgMAPE = Object.values(results).reduce((sum, r) => sum + r.avgMetrics.mape, 0) / totalValidated;
+                const avgMASE = Object.values(results).reduce((sum, r) => sum + r.avgMetrics.mase, 0) / totalValidated;
+                
+                // Create validation summary with key performance indicators
+                document.getElementById('validation-info').innerHTML = 
+                    `<strong>Walk-Forward Validation:</strong> ${totalValidated} OUIs, ${totalFolds} folds | ` +
+                    `Avg MAE: ${avgMAE.toFixed(2)} | Avg MAPE: ${avgMAPE.toFixed(1)}% | Avg MASE: ${avgMASE.toFixed(2)} ` +
+                    `${avgMASE < 1 ? '✓ Better than naive' : '⚠ Check model'} | ` +
+                    `<strong>Outliers:</strong> ${outlierStats.total}/${outlierStats.points} (${outlierStats.pct}%) detected & handled`;
+            }
+            
+            // CHART 1: HISTORICAL DATA
+            const showHistDates = allDates.slice(-histDays), histValsByOUI = {};
+            sortedOuis.forEach(oui => {
+                histValsByOUI[oui] = showHistDates.map(date => dailyGrouped[date] && dailyGrouped[date][oui] || 0)
+            });
+            const histCD = barCustomData(histValsByOUI, showHistDates);
+            
+            Plotly.react('chart', sortedOuis.map(oui => ({
+                x: showHistDates,
+                y: histValsByOUI[oui],
+                customdata: histCD[oui],
+                name: oui,
+                type: 'bar',
+                hovertemplate: 'Date: %{x}<br>OUI: %{fullData.name}<br>Burned: %{y:.2f}<br><b>Total:</b> %{customdata[0]:.2f}<extra></extra>'
+            })), {
+                barmode: 'stack',
+                title: {text: `Historical Daily DC Burned (USD) by OUI`, font: {size: 19}},
+                xaxis: {title: 'Date', type: 'category', tickangle: -45},
+                yaxis: {title: 'DC Burned (USD)'},
+                height: 600, width: 1600, bargap: 0.15,
+                legend: {title: {text: 'OUI'}, x: 1.05, y: 1, orientation: 'v', font: {size: 10}, traceorder: 'normal'},
+                margin: {r: 200, t: 80}
+            });
+
+            // CHART 2: PROJECTION DATA
+            const futureDates = [omittedDate]; 
+            for(let i = 1; i < projDays; i++) futureDates.push(addDays(omittedDate, i));
+            
+            const ouiYsProj = {}, projValsByOUI = {};
+            sortedOuis.forEach(oui => {
+                const ys = allDates.map(date => dailyGrouped[date] && dailyGrouped[date][oui] || 0); 
+                const proj = buildProjection(oui, ys, allDates, projDays); // Generate projections
+                ouiYsProj[oui] = proj;
+                projValsByOUI[oui] = proj;
+            });
+            const projCD = barCustomData(projValsByOUI, futureDates);
+            
+            Plotly.react('projchart', sortedOuis.map(oui => ({
+                x: futureDates,
+                y: ouiYsProj[oui],
+                customdata: projCD[oui],
+                name: oui,
+                type: 'bar',
+                hovertemplate: 'Date: %{x}<br>OUI: %{fullData.name}<br>Projected: %{y:.2f}<br><b>Total:</b> %{customdata[0]:.2f}<extra></extra>'
+            })), {
+                barmode: 'stack',
+                title: {text: `Next ${projDays}-Day Projection: Daily DC Burned (USD) by OUI`, font: {size: 17}},
+                xaxis: {title: 'Projected Date', type: 'category', tickangle: -45, tickfont: {size: 9}},
+                yaxis: {title: 'Projected DC Burned (USD)'},
+                height: 600, width: 1600, bargap: 0.15,
+                legend: {title: {text: 'OUI'}, x: 1.05, y: 1, orientation: 'v', font: {size: 10}, traceorder: 'normal'},
+                margin: {r: 200, t: 80}
+            });
+
+            // CHART 3: COMBINED HISTORICAL + PROJECTION
+            const showComboHistDates = allDates.slice(-comboHistDays), comboFutureDates = [omittedDate]; 
+            for(let i = 1; i < comboProjDays; i++) comboFutureDates.push(addDays(omittedDate, i));
+            
+            const ouiYsComboProj = {}, histComboByOUI = {}, projComboByOUI = {};
+            sortedOuis.forEach(oui => {
+                const ys = allDates.map(date => dailyGrouped[date] && dailyGrouped[date][oui] || 0); 
+                const histVals = showComboHistDates.map(date => dailyGrouped[date] && dailyGrouped[date][oui] || 0); 
+                histComboByOUI[oui] = histVals; 
+                const proj = buildProjection(oui, ys, allDates, comboProjDays); 
+                projComboByOUI[oui] = proj;
+                ouiYsComboProj[oui] = [...histVals, ...proj]; // Combine historical and projected
+            });
+            
+            const comboDates = [...showComboHistDates, ...comboFutureDates];
+            
+            // Merge custom data for combined chart
+            const mergeBarCustomData = (histC, histDates, projC, projDates) => {
+                const totalHist = barCustomData(histC, histDates);
+                const totalProj = barCustomData(projC, projDates);
+                const result = {}; 
+                Object.keys(histC).forEach(oui => {
+                    result[oui] = [...(totalHist[oui] || []), ...(totalProj[oui] || [])]
+                }); 
+                return result;
+            };
+            const comboCD = mergeBarCustomData(histComboByOUI, showComboHistDates, projComboByOUI, comboFutureDates);
+            
+            Plotly.react('combochart', sortedOuis.map(oui => {
+                const histVals = histComboByOUI[oui], projVals = projComboByOUI[oui]; 
+                return {
+                    x: comboDates,
+                    y: [...histVals, ...projVals],
+                    customdata: comboCD[oui],
+                    name: oui,
+                    type: 'bar',
+                    hovertemplate: 'Date: %{x}<br>OUI: %{fullData.name}<br>' + 
+                        (comboDates.length - histVals.length > 0 && "%{x}" >= comboFutureDates[0] ? 
+                        "Projected: %{y:.2f}" : "Burned: %{y:.2f}") + 
+                        "<br><b>Total:</b> %{customdata[0]:.2f}<extra></extra>"
+                }
+            }), {
+                barmode: 'stack',
+                title: {text: `History & Projection: ${comboHistDays}+${comboProjDays} Days (Dashed=projection start)`, font: {size: 17}},
+                xaxis: {title: 'Date', type: 'category', tickangle: -45, tickfont: {size: 9}, range: [-0.5, comboDates.length - 0.5]},
+                yaxis: {title: 'DC Burned (USD)'},
+                height: 600, width: 1600, bargap: 0.15,
+                legend: {title: {text: 'OUI'}, x: 1.05, y: 1, orientation: 'v', font: {size: 10}, traceorder: 'normal'},
+                margin: {r: 200, t: 80},
+                // Add vertical dashed line to separate historical from projected data
+                shapes: [{
+                    type: 'line', xref: 'x', yref: 'paper',
+                    x0: showComboHistDates.length - 0.5, x1: showComboHistDates.length - 0.5,
+                    y0: 0, y1: 1,
+                    line: {color: 'black', width: 2, dash: 'dash'}
+                }]
+            });
+        }
+
+        /**
+         * MAIN APPLICATION INITIALIZATION
+         * Purpose: Loads data, processes it, runs validation, and sets up interactive dashboard
+         */
+        fetch('/data').then(response => response.json()).then(data => {
+            // Step 1: Data Processing
+            const dailyGrouped = aggregateToDaily(data); 
+            let allDatesFull = Object.keys(dailyGrouped).sort();
+            
+            // Step 2: OUI Analysis and Ranking
+            let allOuis = Array.from(new Set([].concat(...Object.values(dailyGrouped).map(x => Object.keys(x))))); 
+            let ouiAvg = {};
+            
+            // Calculate average daily burn for each OUI (excluding zeros for true average)
+            allOuis.forEach(oui => {
+                let sum = 0, days = 0; 
+                allDatesFull.slice(0, -1).forEach(date => {
+                    let v = dailyGrouped[date] && dailyGrouped[date][oui] || 0; 
+                    sum += v;
+                    if(v > 0) days++; // Only count active days for average
+                }); 
+                ouiAvg[oui] = days ? sum/days : 0;
+            });
+            
+            // Sort OUIs by average daily burn (descending)
+            let sortedOuis = allOuis.slice().sort((a, b) => ouiAvg[b] - ouiAvg[a]); 
+            let defaultHistDays = Math.min(30, allDatesFull.length - 1);
+            let defaultProjDays = 30;
+            
+            // Step 3: Model Validation
+            const allDates = allDatesFull.slice(0, -1);
+            const validationResults = TimeSeriesValidator.validateAllOUIs(dailyGrouped, allDates, sortedOuis);
+            
+            // Step 4: UI Setup
+            document.getElementById('hist-days').value = defaultHistDays; 
+            document.getElementById('hist-days').max = allDatesFull.length - 1;
+            document.getElementById('proj-days').value = defaultProjDays; 
+            document.getElementById('combo-hist-days').value = defaultHistDays;
+            document.getElementById('combo-hist-days').max = allDatesFull.length - 1; 
+            document.getElementById('combo-proj-days').value = defaultProjDays;
+            
+            // Step 5: Initial Chart Rendering
+            plotCharts(defaultHistDays, defaultProjDays, defaultHistDays, defaultProjDays, 
+                      dailyGrouped, allDatesFull, sortedOuis, validationResults);
+            
+            // Step 6: Event Handlers for Interactive Updates
+            const getInts = () => [
+                Math.max(1, Math.min(parseInt(document.getElementById('hist-days').value) || defaultHistDays, allDatesFull.length - 1)),
+                Math.max(1, Math.min(parseInt(document.getElementById('proj-days').value) || defaultProjDays, 365)),
+                Math.max(1, Math.min(parseInt(document.getElementById('combo-hist-days').value) || defaultHistDays, allDatesFull.length - 1)),
+                Math.max(1, Math.min(parseInt(document.getElementById('combo-proj-days').value) || defaultProjDays, 365))
+            ];
+            
+            const ids = ['hist-days', 'proj-days', 'combo-hist-days', 'combo-proj-days']; 
+            ids.forEach(id => {
+                document.getElementById(id).oninput = () => 
+                    plotCharts(...getInts(), dailyGrouped, allDatesFull, sortedOuis, validationResults)
+            });
+        });
+    </script>
+</body>
+</html>
