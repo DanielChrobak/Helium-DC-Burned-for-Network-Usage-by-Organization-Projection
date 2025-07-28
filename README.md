@@ -1,6 +1,7 @@
 # Helium-DC-Burned-for-Network-Usage-by-Organization-Projection
 
-Algorithm Summary
+## Algorithm Summary
+
 This comprehensive time series forecasting system implements a sophisticated multi-component approach:
 
 Key Components:
