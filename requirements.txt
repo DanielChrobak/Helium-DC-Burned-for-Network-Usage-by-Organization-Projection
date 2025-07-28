@@ -1,0 +1,4 @@
+flask==2.3.3
+python-dotenv==1.0.0
+dune-client==1.4.0
+APScheduler==3.10.4
