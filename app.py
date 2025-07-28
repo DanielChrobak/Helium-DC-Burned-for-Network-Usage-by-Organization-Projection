@@ -215,7 +215,7 @@ if __name__ == '__main__':
         print("Data API: http://localhost:5000/data")
         print("Status: http://localhost:5000/status")
         
-        app.run(debug=True, use_reloader=False)  # use_reloader=False to prevent scheduler conflicts
+        app.run(debug=True, use_reloader=False, host="0.0.0.0")  # use_reloader=False to prevent scheduler conflicts
         
     except KeyboardInterrupt:
         print("Shutting down...")
