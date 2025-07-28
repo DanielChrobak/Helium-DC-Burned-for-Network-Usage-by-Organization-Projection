@@ -4,8 +4,8 @@
 
 This comprehensive time series forecasting system implements a sophisticated multi-component approach:
 
-Key Components:
-Outlier Detection: Uses IQR, Modified Z-Score, and seasonal methods to identify and handle anomalous data points
+### Key Components:
+1. Outlier Detection: Uses IQR, Modified Z-Score, and seasonal methods to identify and handle anomalous data points
 
 Robust Regression: Implements Huber regression for trend estimation that's resistant to outliers
 
